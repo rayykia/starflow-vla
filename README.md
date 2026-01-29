@@ -9,7 +9,7 @@
 [![arXiv](https://img.shields.io/badge/arXiv-2506.06276-b31b1b.svg)](https://arxiv.org/abs/2506.06276)
 [![arXiv](https://img.shields.io/badge/arXiv-2511.20462-b31b1b.svg)](https://arxiv.org/abs/2511.20462)
 [![NeurIPS](https://img.shields.io/badge/NeurIPS-2025%20Spotlight-blue.svg)](https://neurips.cc/Conferences/2025)
-
+[![HF Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-blue)](https://huggingface.co/apple/starflow)
 </div>
 
 This is the official open source release of **STARFlow** and **STARFlow-V**, state-of-the-art transformer autoregressive flow models for high-quality image and video generation.
@@ -46,9 +46,7 @@ pip install -r requirements.txt
 - `ckpts/starflow_3B_t2i_256x256.pth` - For text-to-image generation
 - `ckpts/starflow-v_7B_t2v_caus_480p_v3.pth` - For text-to-video generation
 
-📅 **Model Release Timeline**: Pretrained checkpoints will be released **soon**. Please check back or watch this repository for updates.
-
-The checkpoint files are not included in this repository due to size constraints.
+The checkpoint files are not included in this repository due to size constraints. Please download via [Hugging Face](https://huggingface.co/apple/starflow).
 
 ### Text-to-Image Generation
 
