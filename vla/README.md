@@ -23,4 +23,4 @@ normalizing flow (see `docs/superpowers/specs/2026-08-15-starflow-vla-design.md`
 chunk); execute the chunk, observe, repeat.
 
 ## Tests
-    python -m pytest vla/tests/ -v
+    PYTHONPATH= python -m pytest vla/tests/ -v   # clear PYTHONPATH if a ROS install pollutes it

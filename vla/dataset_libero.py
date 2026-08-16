@@ -116,6 +116,10 @@ def create_libero_dataloader(args, dist):
     epoch_length = getattr(args, 'epoch_length', 0) or 0
     if sampler is None and 0 < epoch_length < len(dataset):
         sampler = torch.utils.data.RandomSampler(dataset, num_samples=epoch_length)
+    elif isinstance(sampler, DistributedSampler) and 0 < epoch_length < len(dataset) \
+            and getattr(dist, 'local_rank', 0) == 0:
+        print(f'epoch_length={epoch_length} is ignored in distributed mode '
+              f'(using full dataset of {len(dataset)} samples)')
     loader = DataLoader(
         dataset, batch_size=local_bs, sampler=sampler, shuffle=(sampler is None),
         num_workers=args.num_workers, pin_memory=True, drop_last=True,

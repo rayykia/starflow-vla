@@ -229,6 +229,9 @@ class WorldActionModel(Model):
             return super().forward(x, y, reverse=False, kv_caches=kv_caches,
                                    denoiser=denoiser, context=context, **kwargs)
 
+        assert kv_caches is None and not kwargs.get('guidance'), \
+            'joint training forward takes no kv_caches/guidance (use context=True / reverse=True)'
+
         B, A, Da = actions.shape
         logdets_v, logdets_a, outputs = [], [], []
 

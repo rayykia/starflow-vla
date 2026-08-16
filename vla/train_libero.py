@@ -57,7 +57,7 @@ def load_vla_config(config_path: str) -> argparse.Namespace:
 def merge_cli_args(args: argparse.Namespace) -> argparse.Namespace:
     if not getattr(args, 'model_config_path', None):
         return args
-    provided = {a[2:].replace('-', '_') for a in sys.argv[1:] if a.startswith('--')}
+    provided = {a[2:].split('=', 1)[0].replace('-', '_') for a in sys.argv[1:] if a.startswith('--')}
     merged = vars(load_vla_config(args.model_config_path))
     for k, v in vars(args).items():
         if k in provided:
@@ -101,9 +101,17 @@ def main(args):
         import torchinfo
         torchinfo.summary(model)
 
+    grad_accum = max(args.acc, 1)
+    model_name = f'vla_{args.channels}_{len(args.layers_per_block)}_h{args.action_horizon}'
+    ckpt_file = args.logdir / f'libero_model_{model_name}.pth'
+    opt_ckpt_file = args.logdir / f'libero_opt_{model_name}.pth'
+    sample_dir = args.logdir / f'libero_samples_{model_name}'
+    if dist.local_rank == 0:
+        sample_dir.mkdir(parents=True, exist_ok=True)
+
     if args.resume_path:
         print(f'Loading checkpoint: {args.resume_path}')
-        model.load_state_dict(torch.load(args.resume_path, map_location='cpu'), strict=False)
+        model.load_state_dict(torch.load(args.resume_path, map_location='cpu'), strict=True)
         epoch_start = args.resume_epoch or 0
     else:
         epoch_start = 0
@@ -114,15 +122,23 @@ def main(args):
     warmup = args.warmup_steps if args.warmup_steps is not None else num_batches
     lr_schedule = utils.CosineLRSchedule(optimizer, warmup, args.epochs * num_batches,
                                          args.min_lr, args.lr)
-    lr_schedule.counter += epoch_start * num_batches
-    scaler = torch.amp.GradScaler() if args.loss_scaling else None
 
-    grad_accum = max(args.acc, 1)
-    model_name = f'vla_{args.channels}_{len(args.layers_per_block)}_h{args.action_horizon}'
-    ckpt_file = args.logdir / f'libero_model_{model_name}.pth'
-    sample_dir = args.logdir / f'libero_samples_{model_name}'
-    if dist.local_rank == 0:
-        sample_dir.mkdir(parents=True, exist_ok=True)
+    # resume optimizer/LR-schedule state (if present) alongside the model weights
+    opt_state_loaded = False
+    if args.resume_path:
+        if opt_ckpt_file.exists():
+            print(f'Loading optimizer/LR-schedule checkpoint: {opt_ckpt_file}')
+            opt_state = torch.load(opt_ckpt_file, map_location='cpu')
+            optimizer.load_state_dict(opt_state['optimizer'])
+            lr_schedule.load_state_dict(opt_state['lr_schedule'])
+            opt_state_loaded = True
+        else:
+            print(f'No optimizer checkpoint found at {opt_ckpt_file}, starting fresh optimizer/LR state')
+    # loaded lr_schedule state already encodes progress; only bump the counter
+    # from --resume_epoch when we had no opt checkpoint to load it from
+    if not opt_state_loaded:
+        lr_schedule.counter += epoch_start * num_batches
+    scaler = torch.amp.GradScaler() if args.loss_scaling else None
 
     print(f'{" Training ":-^80}')
     total_steps = epoch_start * num_batches
@@ -137,7 +153,8 @@ def main(args):
                 with torch.no_grad():
                     x = vae.encode(frames)                       # (B, 1+H/4, 48, 8, 8)
                 x, _ = add_noise(x, args.noise_std, args.noise_type)
-                actions = actions + args.action_noise_std * torch.randn_like(actions)
+                actions_clean = actions
+                actions = actions_clean + args.action_noise_std * torch.randn_like(actions_clean)
                 with torch.no_grad():
                     y = encode_text(text_encoder, tokenizer,
                                     drop_label(list(instructions), args.drop_label),
@@ -196,6 +213,7 @@ def main(args):
 
         if not args.dry_run:
             utils.save_model(args, dist, model, ckpt_file)
+            utils.save_optimizer(args, dist, optimizer, lr_schedule, opt_ckpt_file)
             if epoch % args.save_every == 0:
                 utils.save_model(args, dist, model, str(ckpt_file) + f'_epoch{epoch + 1:04d}')
         dist.barrier()
@@ -204,7 +222,7 @@ def main(args):
         if args.sample_freq > 0 and (epoch % args.sample_freq == 0) and not args.dry_run:
             from vla.sample_libero import preview_rollout
             preview_rollout(model, vae, text_encoder, tokenizer, args, dist,
-                            frames, instructions, actions, sample_dir, epoch, total_steps)
+                            frames, instructions, actions_clean, sample_dir, epoch, total_steps)
 
         if args.dry_run:
             break

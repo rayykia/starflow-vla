@@ -17,7 +17,7 @@ arguments:
 - cond_top_only: 1
 - use_final_norm: 1
 - soft_clip: 4
-- temporal_causal: 1
+- temporal_causal: 1  # any >0 is equivalent here: only tested ==0; denoiser (block_causal consumer) is disabled
 - shallow_block_local: 1
 - learnable_self_denoiser: 0
 - noise_std: 0.3
