@@ -1,262 +1,124 @@
-# STARFlow: Scalable Transformer Auto-Regressive Flow
+# STARFlow-VLA: A Normalizing-Flow World Action Model
 
-<div align="center">
-  <img src="assets/starflow_logo.png" alt="STARFlow Logo" width="300">
-</div>
+**Image + instruction → future video + action chunk, as one autoregressive normalizing flow.**
 
-<div align="center">
+STARFlow-VLA extends [STARFlow-V](https://arxiv.org/abs/2511.20462) (Apple's transformer
+autoregressive flow for video generation) into a vision-language-action **world action
+model**, trained on [LIBERO](https://libero-project.github.io/) robot manipulation demos:
 
-[![arXiv](https://img.shields.io/badge/arXiv-2506.06276-b31b1b.svg)](https://arxiv.org/abs/2506.06276)
-[![arXiv](https://img.shields.io/badge/arXiv-2511.20462-b31b1b.svg)](https://arxiv.org/abs/2511.20462)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.08078-b31b1b.svg)](https://arxiv.org/abs/2605.08078)
-[![arXiv](https://img.shields.io/badge/arXiv-2605.08029-b31b1b.svg)](https://arxiv.org/abs/2605.08029)
-[![NeurIPS](https://img.shields.io/badge/NeurIPS-2025%20Spotlight-blue.svg)](https://neurips.cc/Conferences/2025)
-[![HF Model](https://img.shields.io/badge/🤗%20Hugging%20Face-Model-blue)](https://huggingface.co/apple/starflow)
-</div>
+> Given one observation image and a language instruction, the model generates a video of
+> the next **H** frames *and* an **H**-step action chunk — jointly, with exact
+> maximum-likelihood training, no diffusion, no separate action head.
 
-This is the official open source release of **STARFlow** and **STARFlow-V**, state-of-the-art transformer autoregressive flow models for high-quality image and video generation.
+## How it works
 
-## 📖 Overview
+The action chunk is treated as *one more group* in the deep flow block's autoregressive
+sequence:
 
-**STARFlow** introduces a novel transformer autoregressive flow architecture that combines the expressiveness of autoregressive models with the efficiency of normalizing flows. The model achieves state-of-the-art results in both text-to-image and text-to-video generation tasks.
+```
+[ text tokens | obs frame | future video latents (Wan2.2 VAE) | H action tokens ]
+```
 
-- **[STARFlow](https://arxiv.org/abs/2506.06276)**:  Scaling Latent Normalizing Flows for High-resolution Image Synthesis (NeurIPS 2025 Spotlight)
-- **[STARFlow-V](https://arxiv.org/abs/2511.20462)**: End-to-End Video Generative Modeling with Normalizing Flows (CVPR 2026 Highlight)
-- **[STARFlow2](https://arxiv.org/abs/2605.08029)**: STARFlow2: Bridging Language Models and Normalizing Flows for Unified Multimodal Generation (Code TBD)
-- **[NTM](https://arxiv.org/abs/2605.08078)**: Normalizing Trajectory Models (Code TBD)
+- **Training** — frames are encoded by the frozen Wan2.2 causal video VAE
+  (`[obs; H frames] → 1 + H/4` latent frames); video latents run through STARFlow-V's
+  per-frame shallow flow blocks, the normalized action chunk `[H, 7]` runs through its
+  own small shallow flow, and one causal deep block models the whole sequence. Action
+  tokens have their own 7-dim projections. The global SOS shift means the last video
+  token predicts the first action — **actions are generated strictly after, and
+  conditioned on, the imagined video**. Loss is a per-modality mean
+  `NLL_video + λ · NLL_action`.
+- **Generation** — encode the observation, run one forward pass to fill the KV caches
+  (i2v-style), then a single deep-block reverse pass emits video tokens and then action
+  tokens; each modality goes through its own shallow inverse, the video is VAE-decoded
+  and the action chunk un-normalized for execution.
+- **Verified invariants** (unit-tested): exact invertibility of the joint flow
+  (~1e-6 reconstruction error), causality (action tokens provably cannot influence
+  video outputs), and observation-prefix preservation through the KV-cache path.
 
-🎬 **[View Video Results Gallery](https://starflow-v.github.io)** - See examples of generated videos and comparisons
+The default config is ~283M parameters at 128×128, single agentview, H = 8 — it trains
+on one 16 GB GPU.
 
-## 🚀 Quick Start
+## Repository layout
 
-### Environment Setup
+All STARFlow-VLA code lives in [`vla/`](vla/); the upstream STARFlow / STARFlow-V
+implementation (`transformer_flow.py`, `train.py`, `sample.py`, `utils/`, `misc/`, …)
+is kept **unmodified** and used as a library.
+
+```
+vla/
+├── transformer_flow_vla.py   # ActionMetaBlock (joint deep block) + WorldActionModel
+├── dataset_libero.py         # raw LIBERO HDF5 dataloader + action normalization
+├── compute_norm_stats.py     # per-dimension action stats (quantile normalization)
+├── train_libero.py           # training entry point
+├── sample_libero.py          # predict() closed-loop policy API + CLI + previews
+├── norm_stats/               # generated stats (libero_10 included)
+└── tests/                    # 14 tests: invertibility, causality, context, dataset
+configs/starflow_vla_libero_128.yaml   # default ~283M config
+```
+
+## Quick start
 
 ```bash
-# Clone the repository
-git clone https://github.com/apple/ml-starflow
-cd ml-starflow
-
-# Set up conda environment (recommended)
-bash scripts/setup_conda.sh
-
-# Or install dependencies manually
-pip install -r requirements.txt
+conda activate starflow
+pip install -r requirements.txt h5py pytest imageio imageio-ffmpeg
 ```
 
-### Model Checkpoints
-
-**Important**: You'll need to download the pretrained model checkpoints and place them in the `ckpts/` directory. For example:
-
-- `ckpts/starflow_3B_t2i_256x256.pth` - For text-to-image generation
-- `ckpts/starflow-v_7B_t2v_caus_480p_v3.pth` - For text-to-video generation
-
-The checkpoint files are not included in this repository due to size constraints. Please download via [Hugging Face](https://huggingface.co/apple/starflow).
-
-### Text-to-Image Generation
-
-Generate high-quality images from text prompts:
+Expects raw LIBERO HDF5 data (e.g. `.../LIBERO/libero/datasets/libero_10/*.hdf5`).
+Compute action normalization stats once per subset choice:
 
 ```bash
-# Basic image generation (256x256)
-bash scripts/test_sample_image.sh "a film still of a cat playing piano"
-
-# Custom prompt and settings
-torchrun --standalone --nproc_per_node 1 sample.py \
-    --model_config_path "configs/starflow_3B_t2i_256x256.yaml" \
-    --checkpoint_path "ckpts/starflow_3B_t2i_256x256.pth" \
-    --caption "your custom prompt here" \
-    --sample_batch_size 8 \
-    --cfg 3.6 \
-    --aspect_ratio "1:1" \
-    --seed 999
+python vla/compute_norm_stats.py \
+  --data_root /path/to/LIBERO/libero/datasets \
+  --subsets libero_10 --output vla/norm_stats/libero_10.json
 ```
 
-### Text-to-Video Generation
-
-Generate videos from text descriptions:
+**Train** (first run downloads the frozen Wan2.2 VAE and flan-t5-xl):
 
 ```bash
-# Basic video generation (480p, ~5 seconds)
-bash scripts/test_sample_video.sh "a corgi dog looks at the camera"
-
-# With custom input image for TI2V video generation
-bash scripts/test_sample_video.sh "a cat playing piano" "/path/to/input/image.jpg"
-
-# Longer video generation (specify target length in frames)
-bash scripts/test_sample_video.sh "a corgi dog looks at the camera" "none" 241  # ~15 seconds at 16fps
-bash scripts/test_sample_video.sh "a corgi dog looks at the camera" "none" 481  # ~30 seconds at 16fps
-
-# Advanced video generation
-torchrun --standalone --nproc_per_node 8 sample.py \
-    --model_config_path "configs/starflow-v_7B_t2v_caus_480p.yaml" \
-    --checkpoint_path "ckpts/starflow-v_7B_t2v_caus_480p_v3.pth" \
-    --caption "your video prompt here" \
-    --sample_batch_size 1 \
-    --cfg 3.5 \
-    --aspect_ratio "16:9" \
-    --out_fps 16 \
-    --jacobi 1 --jacobi_th 0.001 \
-    --target_length 161  # Customize video length
+python vla/train_libero.py --model_config_path configs/starflow_vla_libero_128.yaml
+# multi-GPU: torchrun --nproc_per_node=4 vla/train_libero.py --model_config_path ...
+# any config key can be overridden on the CLI, e.g. --batch_size 32 --action_loss_weight 2.0
 ```
 
-## 🛠️ Training
-
-### Image Training
-
-Train your own STARFlow model for text-to-image generation:
+**Sample / run as a policy**:
 
 ```bash
-# Quick training test
-bash scripts/test_train_image.sh 10 16
-
-# Full training with custom parameters
-torchrun --standalone --nproc_per_node 8 train.py \
-    --model_config_path "configs/starflow_3B_t2i_256x256.yaml" \
-    --epochs 100 \
-    --batch_size 1024 \
-    --wandb_name "my_starflow_training"
+python vla/sample_libero.py --model_config_path configs/starflow_vla_libero_128.yaml \
+  --checkpoint_path logs/libero_model_vla_1024_6_h8.pth --sample_index 0 --cfg 1.5
 ```
 
-### Video Training
-
-Train STARFlow-V for text-to-video generation:
-
-```bash
-# Quick training test
-bash scripts/test_train_video.sh 10 8
-
-# Resume training from checkpoint
-torchrun --standalone --nproc_per_node 8 train.py \
-    --model_config_path "configs/starflow-v_7B_t2v_caus_480p.yaml" \
-    --resume_path "ckpts/starflow-v_7B_t2v_caus_480p_v3.pth" \
-    --epochs 100 \
-    --batch_size 192
+```python
+from vla import predict
+video, action_chunk = predict(model, vae, text_encoder, tokenizer, args,
+                              norm_stats, obs_image, instruction, guidance=1.5)
+# video: (1+H, 3, 128, 128) in [-1, 1]; action_chunk: (H, 7), ready to execute.
 ```
 
-## 🔧 Utilities
+**Tests**: `PYTHONPATH= python -m pytest vla/tests/ -v`
 
-### Video Processing
+## Configuration
 
-Extract individual frames from multi-video grids:
+**[`vla/README.md`](vla/README.md) is the full guide** — every training hyperparameter,
+model-architecture knob (widths, depths, horizon, action-flow sizes), dataset setting,
+and the hard invariants the code asserts (`action_horizon % 4 == 0`, even block count,
+L2R + SOS, etc.). The short version: scale the model with `channels` /
+`layers_per_block` / `top_block_channels`, the horizon with `action_horizon`
+(divisible by 4), and the video-vs-policy trade-off with `action_loss_weight`.
 
-```bash
-# Extract frames from a video containing multiple video grids
-python scripts/extract_image_from_video.py --input_video path/to/video.mp4 --output_dir output/
+## Status / scope (v1)
 
-# Extract images with custom settings
-python scripts/extract_images.py input_file.mp4
-```
+Single camera view, no proprioception conditioning, one action chunk per call (no
+long-horizon rollout stitching yet), no simulator evaluation harness, DDP training
+(keep `fsdp: 0`). See the design doc under `docs/superpowers/specs/` for the
+rationale behind each decision.
 
-## 📁 Model Architecture
+## Acknowledgments & citation
 
-### STARFlow (3B Parameters - Text-to-Image)
-- **Resolution**: 256×256
-- **Architecture**: 6-block deep-shallow architecture
-- **Text Encoder**: T5-XL
-- **VAE**: SD-VAE
-- **Features**: RoPE positional encoding, mixed precision training
-
-### STARFlow-V (7B Parameters - Text-to-Video)
-- **Resolution**: Up to 640×480 (480p)
-- **Temporal**: 81 frames (16 FPS = ~5 seconds)
-- **Architecture**: 6-block deep-shallow architecture (full sequence)
-- **Text Encoder**: T5-XL
-- **VAE**: WAN2.2-VAE
-- **Features**: Causal attention, autoregressive generation, variable length support
-
-## 🔧 Key Features
-
-- **Autoregressive Flow Architecture**: Novel combination of autoregressive models and normalizing flows
-- **High-Quality Generation**: Competetive FID scores and visual quality to State-of-the-art Diffusion Models
-- **Flexible Resolution**: Support for various aspect ratios and resolutions
-- **Efficient Training**: FSDP support for large-scale distributed training
-- **Fast Sampling**: Block-wise Jacobi iteration for accelerated inference
-- **Text Conditioning**: Advanced text-to-image/video capabilities
-- **Video Generation**: Temporal consistency and smooth motion
-
-## 📊 Configuration
-
-### Key Parameters
-
-#### Image Generation (`starflow_3B_t2i_256x256.yaml`)
-- `img_size: 256` - Output image resolution
-- `txt_size: 128` - Text sequence length
-- `channels: 3072` - Model hidden dimension
-- `cfg: 3.6` - Classifier-free guidance scale
-- `noise_std: 0.3` - Flow noise standard deviation
-
-#### Video Generation (`starflow-v_7B_t2v_caus_480p.yaml`)
-- `img_size: 640` - Video frame resolution
-- `vid_size: '81:16'` - Temporal dimensions (frames:downsampling)
-- `fps_cond: 1` - FPS conditioning enabled
-- `temporal_causal: 1` - Causal temporal attention
-
-### Sampling Options
-- `--cfg` - Classifier-free guidance scale (higher = more prompt adherence)
-- `--jacobi` - Enable Jacobi iteration for faster sampling
-- `--jacobi_th` - Jacobi convergence threshold
-- `--jacobi_block_size` - Block size for Jacobi iteration
-- `--aspect_ratio` - Output aspect ratio ("1:1", "16:9", "4:3", etc.)
-- `--seed` - Random seed for reproducible generation
-
-## 📚 Project Structure
-
-```
-├── train.py               # Main training script
-├── sample.py              # Sampling and inference
-├── transformer_flow.py    # Core model implementation
-├── dataset.py             # Dataset loading and preprocessing
-├── finetune_decoder.py    # Decoder fine-tuning script
-├── utils/                 # Utility modules
-│   ├── common.py         # Core utility functions
-│   ├── model_setup.py    # Model configuration and setup
-│   ├── training.py       # Training utilities and metrics
-│   └── inference.py      # Evaluation and metrics
-├── configs/              # Model configuration files
-│   ├── starflow_3B_t2i_256x256.yaml
-│   └── starflow-v_7B_t2v_caus_480p.yaml
-├── scripts/                 # Example training and sampling scripts
-│   ├── test_sample_image.sh
-│   ├── test_sample_video.sh
-│   ├── test_train_image.sh
-│   ├── test_train_video.sh
-│   ├── setup_conda.sh
-│   ├── extract_images.py
-│   └── extract_image_from_video.py
-└── misc/                  # Additional utilities
-    ├── pe.py             # Positional encodings
-    ├── lpips.py          # LPIPS loss
-    └── wan_vae2.py       # Video VAE implementation
-```
-
-## 💡 Tips
-
-### Image Generation
-1. Use guidance scales between 2.0-5.0 for balanced quality and diversity
-2. Experiment with different aspect ratios for your use case
-3. Enable Jacobi iteration (`--jacobi 1`) for faster sampling
-4. Use higher resolution models for detailed outputs
-5. The default script uses optimized settings: `--jacobi_th 0.001` and `--jacobi_block_size 16` 
-
-### Video Generation
-1. Start with shorter sequences (81 frames) and gradually increase length (161, 241, 481+ frames)
-2. Use input images (`--input_image`) for more controlled generation
-3. Adjust FPS settings based on content type (8-24 FPS)
-4. Consider temporal consistency when crafting prompts
-5. The default script uses `--jacobi_block_size 64`.
-6. **Longer videos**: Use `--target_length` to generate videos beyond the training length (requires `--jacobi 1`)
-7. **Frame reference**: 81 frames ≈ 5s, 161 frames ≈ 10s, 241 frames ≈ 15s, 481 frames ≈ 30s (at 16fps)
-
-### Training
-1. Use FSDP for efficient large model training
-2. Start with smaller batch sizes and scale up
-3. Monitor loss curves and adjust learning rates accordingly
-4. Use gradient checkpointing to reduce memory usage
-5. The test scripts include `--dry_run 1` for validation
-
-## 🔗 Citation
-
-If you use STARFlow in your research, please cite:
+This project builds directly on Apple's open-source
+[**ml-starflow**](https://github.com/apple/ml-starflow) — **STARFlow**
+([NeurIPS 2025 Spotlight](https://arxiv.org/abs/2506.06276)) and **STARFlow-V**
+([arXiv:2511.20462](https://arxiv.org/abs/2511.20462)) — whose code is included here
+unmodified. If you use this repository, please cite their work:
 
 ```bibtex
 @article{gu2025starflow,
@@ -267,13 +129,7 @@ If you use STARFlow in your research, please cite:
 }
 ```
 
-## 📄 License
+## License
 
-LICENSE: Please check out the repository [LICENSE](LICENSE) before using the provided code and [LICENSE_MODEL](LICENSE_MODEL) for the released models.
-
-## 🤝 Contributing
-
-We welcome contributions! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
-
-
-
+The upstream STARFlow code retains its original terms — see [LICENSE](LICENSE) and
+[LICENSE_MODEL](LICENSE_MODEL) before using the code or released models.
