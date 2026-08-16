@@ -4,7 +4,7 @@ Image + instruction -> next-H-frames video + H-step action chunk, as one
 normalizing flow (see `docs/superpowers/specs/2026-08-15-starflow-vla-design.md`).
 
 ## Setup
-    pip install h5py pytest   # inside the starflow env
+    pip install h5py pytest imageio imageio-ffmpeg   # inside the starflow env
 
 ## Norm stats (once per subset choice)
     python vla/compute_norm_stats.py \
