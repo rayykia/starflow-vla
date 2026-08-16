@@ -9,13 +9,26 @@ import pathlib
 import sys
 
 import torch
+from einops import rearrange
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 import utils
-from misc import print
-from utils import encode_text, add_noise, save_samples_unified
+from misc import print, dividable
+from utils import encode_text, add_noise
 from vla.dataset_libero import LiberoVLADataset, load_action_norm_stats, unnormalize_actions
+
+
+def save_video_grid(video_px: torch.Tensor, path, fps: int = 10):
+    """Write a (B, T, 3, H, W) [-1, 1] tensor as one grid mp4.
+
+    Local replacement for upstream save_samples_unified's video path: the
+    installed torchvision (>= 0.23) removed tv.io.write_video.
+    """
+    import imageio.v2 as imageio
+    video = ((video_px.detach().float().cpu().clamp(-1, 1) + 1) * 127.5).to(torch.uint8)
+    grid = rearrange(video, '(a b) t c h w -> t (a h) (b w) c', a=dividable(video.size(0)))
+    imageio.mimwrite(str(path), list(grid.numpy()), fps=fps)
 
 
 @torch.no_grad()
@@ -63,10 +76,10 @@ def preview_rollout(model, vae, text_encoder, tokenizer, args, dist,
         video_px, a_gen = generate_rollout(
             model, vae, text_encoder, tokenizer, args,
             frames[:n, :1], list(instructions[:n]), args.preview_guidance, device)
-    save_samples_unified(
-        samples=video_px.float(), save_dir=sample_dir, filename_prefix='rollout',
-        epoch_or_iter=epoch + 1, fps=10, dist=dist,
-        wandb_log=False, grid_arrangement='grid')
+    if dist is None or dist.local_rank == 0:
+        out_path = sample_dir / f'rollout_epoch{epoch + 1:04d}.mp4'
+        save_video_grid(video_px, out_path, fps=10)
+        print(f'Saved preview rollout to {out_path}')
     mae = (a_gen.float() - actions[:n].float()).abs().mean().item()
     print(f'[preview] epoch {epoch + 1}: action MAE (normalized) = {mae:.4f}')
     model.train()
@@ -108,8 +121,8 @@ def main():
             frames[0], instruction, guidance=cli.cfg)
 
     out_dir = pathlib.Path(args.logdir) / 'vla_samples'
-    save_samples_unified(samples=video[None].float().cpu(), save_dir=out_dir,
-                         filename_prefix='predict', epoch_or_iter=cli.sample_index, fps=10)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    save_video_grid(video[None], out_dir / f'predict_{cli.sample_index:03d}.mp4', fps=10)
     print(f'instruction : {instruction}')
     print(f'predicted   :\n{action_chunk.numpy().round(3)}')
     print(f'ground truth:\n{unnormalize_actions(gt_actions, norm_stats).numpy().round(3)}')
