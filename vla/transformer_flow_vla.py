@@ -179,3 +179,152 @@ class ActionMetaBlock(MetaBlock):
 
         x = self.permutation(x, inverse=True)
         return x.to(original_dtype), a.to(original_dtype)
+
+
+class WorldActionModel(Model):
+    """STARFlow-V + action chunk: image+text -> video + H actions, one joint flow."""
+
+    def __init__(self, *, action_horizon=8, action_dim=7, action_channels=256,
+                 action_head_dim=64, action_layers=(2, 2), action_loss_weight=1.0,
+                 **kwargs):
+        super().__init__(**kwargs)
+        assert kwargs.get('seq_order') == 'L2R', 'STARFlow-VLA requires seq_order=L2R'
+        self.action_horizon = action_horizon
+        self.action_dim = action_dim
+        self.action_loss_weight = action_loss_weight
+
+        # upgrade the top block in place (asserts sos + PermutationIdentity)
+        self.blocks[-1] = ActionMetaBlock.upgrade(self.blocks[-1], action_dim)
+
+        # action shallow flow: small MetaBlocks over the chunk alone, shaped
+        # (B, A, 1, Da), alternating direction, 1D RoPE over the A steps
+        perms = [PermutationIdentity(action_horizon), PermutationFlip(action_horizon)]
+        self.action_blocks = torch.nn.ModuleList([
+            MetaBlock(
+                in_channels=action_dim, channels=action_channels,
+                img_size=action_horizon, permutation=perms[i % 2],
+                pt_seq_len=action_horizon, num_layers=num_layers,
+                head_dim=action_head_dim, txt_size=0, txt_dim=0,
+                use_rope=True, use_sos=self.use_sos, use_softplus=self.use_softplus,
+                use_swiglu=kwargs.get('use_swiglu', False),
+                use_qk_norm=kwargs.get('use_qk_norm', False),
+                use_post_norm=kwargs.get('use_post_norm', False),
+                use_final_norm=kwargs.get('use_final_norm', False),
+                use_bias=kwargs.get('use_bias', True),
+                norm_type=kwargs.get('norm_type', 'layer_norm'),
+                soft_clip=kwargs.get('soft_clip', 0),
+            ) for i, num_layers in enumerate(action_layers)])
+        self.action_rope = VisionRotaryEmbeddingFast(
+            dim=action_head_dim // 2, pt_seq_len=action_horizon,
+            no_buffer=True, is_1d=True)
+
+    def forward(self, x, y=None, actions=None, reverse=False, kv_caches=None,
+                denoiser=False, context=False, **kwargs):
+        if reverse:
+            assert actions is not None, 'reverse needs action noise z_a as `actions`'
+            return self.reverse(x, actions, y, kv_caches=kv_caches, **kwargs)
+        if context or denoiser or actions is None:
+            # context pass (obs only), denoiser, or plain video forward: parent
+            # handles it; ActionMetaBlock.forward(actions=None) behaves as MetaBlock
+            return super().forward(x, y, reverse=False, kv_caches=kv_caches,
+                                   denoiser=denoiser, context=context, **kwargs)
+
+        B, A, Da = actions.shape
+        logdets_v, logdets_a, outputs = [], [], []
+
+        # video shallow flow (per-frame with shallow_block_local, as upstream)
+        x = self.patchify(x)
+        outputs.append(x)
+        for block in self.blocks[:-1]:
+            if self.shallow_block_local and x.dim() == 5:
+                x = rearrange(x, 'b t h w c -> (b t) 1 h w c')
+            x, _, logdet = block(x, y, self.feat_rope, kv_cache=None)
+            if self.shallow_block_local and x.dim() == 5:
+                x = rearrange(x, '(b t) 1 h w c -> b t h w c',
+                              b=outputs[0].size(0), t=outputs[0].size(1))
+                logdet = rearrange(logdet, '(b t) l c -> b t l c',
+                                   b=outputs[0].size(0), t=outputs[0].size(1))
+            logdets_v.append(logdet)
+            outputs.append(x)
+
+        # action shallow flow
+        a = actions.view(B, A, 1, Da)
+        for block in self.action_blocks:
+            a, _, logdet_a = block(a, None, self.action_rope)
+            logdets_a.append(logdet_a)
+        a = a.reshape(B, A, Da)
+
+        # joint deep block
+        z_v, z_a, y, logdet_v, logdet_a = self.blocks[-1](
+            x, y, self.feat_rope_gen, actions=a)
+        logdets_v.append(logdet_v)
+        logdets_a.append(logdet_a)
+        outputs.append(z_v)
+        return self.unpatchify(z_v), z_a, outputs, logdets_v, logdets_a
+
+    def get_loss(self, z_v, logdets_v, z_a, logdets_a, action_loss_weight=None):
+        # separate per-modality means: action dims are <1% of total, a joint
+        # mean would starve the policy gradient
+        w = self.action_loss_weight if action_loss_weight is None else action_loss_weight
+        loss_v_z = 0.5 * z_v.pow(2).mean(dim=tuple(range(1, z_v.dim())))
+        loss_v_ld = -sum(ld.mean(dim=tuple(range(1, ld.dim()))) for ld in logdets_v)
+        loss_a_z = 0.5 * z_a.pow(2).mean(dim=tuple(range(1, z_a.dim())))
+        loss_a_ld = -sum(ld.mean(dim=tuple(range(1, ld.dim()))) for ld in logdets_a)
+        loss = ((loss_v_z + loss_v_ld) + w * (loss_a_z + loss_a_ld)).mean()
+        return {'loss': loss,
+                'loss_video_z': loss_v_z.detach().mean(),
+                'loss_video_logdet': loss_v_ld.detach().mean(),
+                'loss_action_z': loss_a_z.detach().mean(),
+                'loss_action_logdet': loss_a_ld.detach().mean()}
+
+    def reverse(self, x, actions, y=None, guidance=0, verbose=False,
+                kv_caches=None, **sampling_kwargs):
+        need_caches = kv_caches is not None
+        kv_caches = kv_caches if kv_caches is not None \
+            else [KVCache() for _ in range(len(self.blocks))]
+        B = x.size(0)
+
+        # deep block: one AR pass generates video tokens then action tokens
+        xp = self.patchify(x)
+        xp, a = self.blocks[-1].reverse(
+            xp, actions, y, guidance, rope=self.feat_rope_gen,
+            kv_cache=kv_caches[0], verbose=verbose, **sampling_kwargs)
+        x = self.unpatchify(xp)
+        if not need_caches:
+            kv_caches[0].delete()
+
+        # shallow blocks are unconditional under cond_top_only: drop guidance
+        if self.cond_top_only and guidance > 0:
+            guidance, y = 0, y.chunk(2, dim=0)[0]
+
+        seq = [x]
+        x = self.reverse_shallow(x, y, guidance, verbose, kv_caches,
+                                 False, need_caches, seq, **sampling_kwargs)
+
+        for block in reversed(self.action_blocks):
+            a = block.reverse(a.view(B, self.action_horizon, 1, self.action_dim),
+                              None, 0, rope=self.action_rope, kv_cache=KVCache())
+            a = a.reshape(B, self.action_horizon, self.action_dim)
+        return x, a
+
+
+def setup_vla_model(args, txt_dim):
+    return WorldActionModel(
+        in_channels=args.channel_size, img_size=args.img_size,
+        patch_size=args.patch_size, channels=args.channels,
+        num_blocks=len(args.layers_per_block), layers_per_block=args.layers_per_block,
+        head_dim=args.head_dim, num_heads=args.num_heads, num_kv_heads=args.num_kv_heads,
+        rope=args.rope, pt_seq_len=args.pt_seq_len, sos=args.sos,
+        txt_size=args.txt_size, txt_dim=txt_dim, cond_top_only=args.cond_top_only,
+        use_softplus=args.use_softplus, use_swiglu=args.use_swiglu,
+        use_bias=args.use_bias, use_qk_norm=args.use_qk_norm,
+        use_post_norm=args.use_post_norm, use_final_norm=args.use_final_norm,
+        norm_type=args.norm_type, soft_clip=args.soft_clip, seq_order=args.seq_order,
+        temporal_causal=args.temporal_causal, shallow_block_local=args.shallow_block_local,
+        top_block_channels=args.top_block_channels,
+        use_checkpoint=args.gradient_checkpoint,
+        use_checkpoint_mlp=args.gradient_checkpoint_mlp,
+        action_horizon=args.action_horizon, action_dim=args.action_dim,
+        action_channels=args.action_channels, action_head_dim=args.action_head_dim,
+        action_layers=args.action_layers, action_loss_weight=args.action_loss_weight,
+    )
