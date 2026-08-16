@@ -31,6 +31,8 @@ class ActionMetaBlock(MetaBlock):
         assert isinstance(block.permutation, PermutationIdentity), (
             'top block must use PermutationIdentity: use seq_order=L2R with an '
             'even number of blocks')
+        assert block.local_attn_window is None, \
+            'ActionMetaBlock does not support local_attn_window (cache sizing excludes action tokens)'
         block.__class__ = cls
         channels = block.proj_in.out_features
         block.action_dim = action_dim

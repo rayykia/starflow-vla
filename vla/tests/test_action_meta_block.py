@@ -67,3 +67,26 @@ def test_deep_block_invertibility():
         x_rec, a_rec = blk.reverse(z_v, z_a, y, rope=rope, kv_cache=KVCache())
     torch.testing.assert_close(x_rec, x, atol=2e-3, rtol=1e-3)
     torch.testing.assert_close(a_rec, a, atol=2e-3, rtol=1e-3)
+
+
+def test_prefix_reuse_and_guidance():
+    blk, rope = make_block()
+    x, y, a = make_inputs()
+    with torch.no_grad():
+        # Part A: prefix reuse (i2v-style)
+        # context pass on frame 0 fills the cache (video-only MetaBlock path)
+        kv = KVCache()
+        blk(x[:, :1], y, rope=rope, kv_cache=kv)
+        z_v = torch.randn_like(x)
+        z_a = torch.randn(B, A, Da)
+        x_gen, a_gen = blk.reverse(z_v, z_a, y, rope=rope, kv_cache=kv)
+        assert x_gen.shape == x.shape and a_gen.shape == (B, A, Da)
+        torch.testing.assert_close(x_gen[:, :1], x[:, :1], atol=1e-4, rtol=1e-4)
+
+        # Part B: guidance branch (CFG smoke)
+        y_cfg = torch.cat([y, y], dim=0)
+        with torch.no_grad():
+            x_g, a_g = blk.reverse(torch.randn_like(x), torch.randn(B, A, Da),
+                                   y_cfg, guidance=1.0, rope=rope, kv_cache=KVCache())
+        assert x_g.shape == x.shape and a_g.shape == (B, A, Da)
+        assert torch.isfinite(x_g).all() and torch.isfinite(a_g).all()
