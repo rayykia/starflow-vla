@@ -60,3 +60,18 @@ def test_context_prefix_preserved():
                              reverse=True, kv_caches=kv_caches)
     assert x_gen.shape == x.shape and a_gen.shape == a.shape
     torch.testing.assert_close(x_gen[:, :1], obs, atol=5e-3, rtol=1e-2)
+
+
+def test_model_cfg_smoke():
+    # context + classifier-free guidance: the production sampling path
+    model = tiny_model()
+    x, y, a = make_inputs()
+    obs = x[:, :1]
+    y_cfg = torch.cat([y, torch.zeros_like(y)], dim=0)  # cond + null halves
+    with torch.no_grad():
+        kv_caches = model(obs, y_cfg, context=True)     # use_cfg: obs batch B, y batch 2B
+        x_gen, a_gen = model(torch.randn_like(x), y_cfg, actions=torch.randn_like(a),
+                             reverse=True, kv_caches=kv_caches, guidance=1.0)
+    assert x_gen.shape == x.shape and a_gen.shape == a.shape
+    assert torch.isfinite(x_gen).all() and torch.isfinite(a_gen).all()
+    torch.testing.assert_close(x_gen[:, :1], obs, atol=5e-3, rtol=1e-2)
