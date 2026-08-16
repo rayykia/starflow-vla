@@ -57,3 +57,13 @@ def test_delegates_when_actions_none():
     with torch.no_grad():
         out = blk(x, y, rope=rope)  # MetaBlock 3-tuple path
     assert len(out) == 3
+
+
+def test_deep_block_invertibility():
+    blk, rope = make_block()
+    x, y, a = make_inputs()
+    with torch.no_grad():
+        z_v, z_a, _, _, _ = blk(x, y, rope=rope, actions=a)
+        x_rec, a_rec = blk.reverse(z_v, z_a, y, rope=rope, kv_cache=KVCache())
+    torch.testing.assert_close(x_rec, x, atol=2e-3, rtol=1e-3)
+    torch.testing.assert_close(a_rec, a, atol=2e-3, rtol=1e-3)

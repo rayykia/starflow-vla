@@ -105,3 +105,75 @@ class ActionMetaBlock(MetaBlock):
         z_a, logdet_a = self._couple(out_a, a_in)
         z_v = self.permutation(z_v, inverse=True)     # (B, T, h, w, C)
         return z_v, z_a, y, logdet_v, logdet_a
+
+    def reverse_step_action(self, x, a, j, kv_cache, attn_temp=1.0, freqs_cis=None):
+        # Input at action step j: last video token (j == 0) or a_{j-1}; output
+        # always through the action head, predicting a_j.
+        original_dtype = a.dtype
+        if j == 0:
+            h = self.get_proj_in(x[:, -1:].to(self.proj_in.weight.dtype))
+        else:
+            h = self.proj_in_act(a[:, j - 1:j].to(self.proj_in_act.weight.dtype))
+        for i, block in enumerate(self.attn_blocks):
+            h, _ = block(h, None, attn_temp=attn_temp, freqs_cis=freqs_cis,
+                         kv_cache=partial(kv_cache, i))
+        if self.use_final_norm:
+            h = self.final_norm(h)
+        h = self.proj_out_act(h)
+        if self.soft_clip > 0:
+            h = self.soft_clip * torch.tanh(h / self.soft_clip)
+        xa, xb = h.chunk(2, dim=-1)
+        return xa.to(original_dtype), xb.to(original_dtype)
+
+    def reverse(self, z, z_act, y=None, guidance=0, guide_what='ab', attn_temp=1.0,
+                annealed_guidance=False, rope=None, verbose=False,
+                kv_cache: KVCache = None, **unused_kwargs):
+        kv_cache = kv_cache if kv_cache is not None else KVCache()
+        original_dtype = z.dtype
+        z, z_act = z.float(), z_act.float()
+        A = z_act.size(1)
+        freqs_cis = self.get_freqs_cis(z, y, rope, num_actions=A) if rope is not None else None
+        if guidance > 0:
+            z, z_act = torch.cat([z, z], 0), torch.cat([z_act, z_act], 0)
+
+        reuse_kv_cache = kv_cache.prefix_cache is not None and kv_cache.kv_index[0] > 0
+        kv_cache = self.initialize_kv_cache(kv_cache, z, freqs_cis, reuse_kv_cache)
+
+        z = self.permutation(z)
+        if self.txt_dim > 0 and not reuse_kv_cache:
+            self.reverse_step_condition(y, kv_cache, None, attn_temp, freqs_cis)
+        txt_size = y.size(1) if self.txt_dim > 0 else 0
+
+        x = z.clone()
+        if reuse_kv_cache:
+            x[:, :kv_cache.prefix_cache.size(1)] = kv_cache.prefix_cache
+
+        def _scale(za):
+            za = F.softplus(za + INV_SOFTPLUS_1) if self.use_softplus else za.exp()
+            return za.squeeze(1)
+
+        T = x.size(1)  # use_sos asserted at upgrade time
+        for t in tqdm.trange(T, disable=not verbose, desc='VLA deep-block video', leave=False):
+            if reuse_kv_cache and kv_cache.kv_index[0] > t + txt_size:
+                continue  # obs prefix already cached
+            za, zb = self.reverse_step(x, t, kv_cache, None, y, attn_temp, freqs_cis)
+            za, zb = _scale(za.float()), zb.float().squeeze(1)
+            if guidance > 0 and guide_what:
+                r = (t + 1) / T if annealed_guidance else 1.0
+                zb, za = self.guidance(za, zb, guidance, r, guide_what)
+            x[:, t] = z[:, t] * za + zb
+
+        a = z_act.clone()
+        for j in range(A):
+            za, zb = self.reverse_step_action(x, a, j, kv_cache, attn_temp, freqs_cis)
+            za, zb = _scale(za.float()), zb.float().squeeze(1)
+            if guidance > 0 and guide_what:
+                zb, za = self.guidance(za, zb, guidance, 1.0, guide_what)
+            a[:, j] = z_act[:, j] * za + zb
+
+        if guidance > 0:
+            x, a = x.chunk(2, dim=0)[0], a.chunk(2, dim=0)[0]
+            kv_cache.remove_negative_cache()
+
+        x = self.permutation(x, inverse=True)
+        return x.to(original_dtype), a.to(original_dtype)
