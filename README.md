@@ -35,7 +35,8 @@ sequence:
   (~1e-6 reconstruction error), causality (action tokens provably cannot influence
   video outputs), and observation-prefix preservation through the KV-cache path.
 
-The default config is ~283M parameters at 128×128, single agentview, H = 8 — it trains
+The default config is ~283M parameters at 128×128, two views (agentview + wrist,
+channel-concatenated latents), H = 8 — it trains
 on one 16 GB GPU.
 
 ## Repository layout
@@ -48,7 +49,7 @@ is kept **unmodified** and used as a library.
 vla/
 ├── transformer_flow_vla.py   # ActionMetaBlock (joint deep block) + WorldActionModel
 ├── dataset_libero.py         # raw LIBERO HDF5 dataloader + action normalization
-├── compute_norm_stats.py     # per-dimension action stats (quantile normalization)
+├── compute_norm_stats.py     # per-dimension action/state mean & std (z-score normalization)
 ├── train_libero.py           # training entry point
 ├── sample_libero.py          # predict() closed-loop policy API + CLI + previews
 ├── norm_stats/               # generated stats (libero_10 included)
@@ -72,11 +73,17 @@ python vla/compute_norm_stats.py \
   --subsets libero_10 --output vla/norm_stats/libero_10.json
 ```
 
-**Train** (first run downloads the frozen Wan2.2 VAE and flan-t5-xl):
+**Train** (first run downloads the frozen Wan2.2 VAE and SmolVLM-500M-Instruct, the
+condition encoder that reads the instruction + current observation; the 8-D proprio
+state is projected into one extra condition token):
 
 ```bash
+# 4-GPU DDP + wandb (credentials in configs/wandb.env, gitignored)
+bash scripts/train_vla_libero.sh
+GPUS=0,4,5,6 BATCH_SIZE=64 RUN_NAME=libero10-h8 bash scripts/train_vla_libero.sh
+
+# single GPU
 python vla/train_libero.py --model_config_path configs/starflow_vla_libero_128.yaml
-# multi-GPU: torchrun --nproc_per_node=4 vla/train_libero.py --model_config_path ...
 # any config key can be overridden on the CLI, e.g. --batch_size 32 --action_loss_weight 2.0
 ```
 
@@ -89,9 +96,22 @@ python vla/sample_libero.py --model_config_path configs/starflow_vla_libero_128.
 
 ```python
 from vla import predict
-video, action_chunk = predict(model, vae, text_encoder, tokenizer, args,
-                              norm_stats, obs_image, instruction, guidance=1.5)
+video, action_chunk = predict(model, vae, args, norm_stats, obs_image, instruction,
+                              proprio_raw, guidance=1.5, denoise=True)
+# obs_image (3, 128, 128) in [-1, 1], proprio_raw (8,) = [ee_pos, ee_ori, gripper_states];
 # video: (1+H, 3, 128, 128) in [-1, 1]; action_chunk: (H, 7), ready to execute.
+# denoise=True: one score-based (Tweedie) step with the training noise stds.
+```
+
+**Evaluate on LIBERO** (client/server, see [`vla/eval_libero/README.md`](vla/eval_libero/README.md)):
+
+```bash
+# server (nfvla env) -- samples + score-denoises the chunk with the config's action_noise_std,
+# and batches all connected clients into one sampling pass
+GPU=0 PORT=8000 CKPT=logs/libero_model_vla_1024_6_h8.pth bash vla/eval_libero/run_server.sh
+# clients (libero env): port, trials/task, output dir, rendering GPUs, shards per suite
+bash vla/eval_libero/run_eval_all.sh 8000 50 eval_results/starflow_vla "1 2" 16
+python vla/eval_libero/summarize_results.py eval_results/starflow_vla
 ```
 
 **Tests**: `PYTHONPATH= python -m pytest vla/tests/ -v`
@@ -107,9 +127,10 @@ L2R + SOS, etc.). The short version: scale the model with `channels` /
 
 ## Status / scope (v1)
 
-Single camera view, no proprioception conditioning, one action chunk per call (no
-long-horizon rollout stitching yet), no simulator evaluation harness, DDP training
-(keep `fsdp: 0`). See the design doc under `docs/superpowers/specs/` for the
+Single camera view, one action chunk per call (no long-horizon rollout stitching yet),
+DDP training (keep `fsdp: 0`). Conditioning = SmolVLM(obs, instruction) tokens +
+proprio token (see `vla/README.md` §1.1). LIBERO
+evaluation lives in `vla/eval_libero/`. See the design doc under `docs/superpowers/specs/` for the
 rationale behind each decision.
 
 ## Acknowledgments & citation

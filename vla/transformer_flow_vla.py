@@ -1,9 +1,16 @@
 """STARFlow-VLA: video + action-chunk normalizing flow on top of STARFlow-V.
 
-The deep block runs one causal AR flow over [text | video tokens | H action
+The deep block runs one causal AR flow over [condition | video tokens | H action
 tokens]. The global SOS shift means the output at the last video token predicts
 action a_0, so the chunk is generated strictly after (and conditioned on) the
 video. Actions use their own input/output projections (7-dim vs 48-dim video).
+
+Conditioning (replaces the flan-T5 text prefix): SmolVLM encodes the instruction
+together with the current observation (vla/vlm_encoder.py); its token features are
+linearly projected to the deep-block width and concatenated with a projected
+proprioception token, `y = [proj_p(proprio) | proj_v(vlm_features)]`, exactly as
+SimVLANF's ContextVideoNF.build_condition does. `y` then takes the place of the
+text tokens in the deep block (whose own `proj_txt` becomes the identity).
 """
 import tqdm
 import torch
@@ -182,11 +189,18 @@ class ActionMetaBlock(MetaBlock):
 
 
 class WorldActionModel(Model):
-    """STARFlow-V + action chunk: image+text -> video + H actions, one joint flow."""
+    """STARFlow-V + action chunk: obs image + instruction (+ proprio) -> video + H actions.
+
+    With `vlm_dim > 0` the model owns the condition path: `vlm` (a SmolVLMEncoder,
+    optional -- tests feed features directly) produces per-token features, which
+    `build_condition` projects and concatenates with the projected proprio token.
+    The result already has the deep-block width, so the deep block's `proj_txt`
+    is replaced by the identity (`txt_dim` must equal the top-block width).
+    """
 
     def __init__(self, *, action_horizon=8, action_dim=7, action_channels=256,
                  action_head_dim=64, action_layers=(2, 2), action_loss_weight=1.0,
-                 **kwargs):
+                 vlm_dim=0, proprio_dim=0, vlm=None, **kwargs):
         super().__init__(**kwargs)
         assert kwargs.get('seq_order') == 'L2R', 'STARFlow-VLA requires seq_order=L2R'
         self.action_horizon = action_horizon
@@ -195,6 +209,22 @@ class WorldActionModel(Model):
 
         # upgrade the top block in place (asserts sos + PermutationIdentity)
         self.blocks[-1] = ActionMetaBlock.upgrade(self.blocks[-1], action_dim)
+
+        # condition path: [proprio token | VLM tokens], projected to the deep-block width
+        self.vlm_dim, self.proprio_dim = vlm_dim, proprio_dim
+        self.vlm = vlm
+        if vlm_dim > 0:
+            assert proprio_dim > 0, 'vlm_dim > 0 requires proprio_dim > 0'
+            assert kwargs.get('txt_dim') == self.top_block_channels, (
+                f'condition tokens are projected to the top-block width '
+                f'({self.top_block_channels}); pass txt_dim={self.top_block_channels}')
+            assert vlm is None or getattr(vlm, 'hidden_size', vlm_dim) == vlm_dim, \
+                'vlm.hidden_size must match vlm_dim'
+            self.vlm_proj = torch.nn.Linear(vlm_dim, self.top_block_channels)
+            self.proprio_proj = torch.nn.Linear(proprio_dim, self.top_block_channels)
+            self.blocks[-1].proj_txt = torch.nn.Identity()  # projection lives here now
+        else:
+            assert vlm is None, 'a VLM needs vlm_dim > 0'
 
         # action shallow flow: small MetaBlocks over the chunk alone, shaped
         # (B, A, 1, Da), alternating direction, 1D RoPE over the A steps
@@ -218,8 +248,29 @@ class WorldActionModel(Model):
             dim=action_head_dim // 2, pt_seq_len=action_horizon,
             no_buffer=True, is_1d=True)
 
+    # ---------------------------------------------------------------- condition
+    def build_condition(self, vlm_features, proprio):
+        """vlm_features (B, L, vlm_dim), proprio (B, proprio_dim) normalized
+        -> y (B, 1 + L, C): projected proprio token first, then projected VLM tokens."""
+        assert self.vlm_dim > 0, 'model was built without a condition path (vlm_dim=0)'
+        dtype = self.vlm_proj.weight.dtype
+        proprio_tok = self.proprio_proj(proprio.to(dtype)).unsqueeze(1)
+        vlm_tok = self.vlm_proj(vlm_features.to(dtype))
+        return torch.cat([proprio_tok, vlm_tok], dim=1)
+
+    def encode_condition(self, images, instructions, proprio):
+        """images (B, 3, h, w) in [-1, 1] (the current observation), B instruction
+        strings, proprio (B, proprio_dim) normalized -> y (B, 1 + L, C)."""
+        assert self.vlm is not None, 'encode_condition needs the VLM (pass vlm= at construction)'
+        features, _ = self.vlm(images, instructions)
+        return self.build_condition(features, proprio)
+
     def forward(self, x, y=None, actions=None, reverse=False, kv_caches=None,
-                denoiser=False, context=False, **kwargs):
+                denoiser=False, context=False, cond=None, **kwargs):
+        # `cond` = dict(images=..., instructions=..., proprio=...): encode the
+        # condition inside forward so DDP sees the VLM / projection gradients
+        if y is None and cond is not None:
+            y = self.encode_condition(**cond)
         if reverse:
             assert actions is not None, 'reverse needs action noise z_a as `actions`'
             return self.reverse(x, actions, y, kv_caches=kv_caches, **kwargs)
@@ -311,14 +362,24 @@ class WorldActionModel(Model):
         return x, a
 
 
-def setup_vla_model(args, txt_dim):
+def setup_vla_model(args, vlm=None):
+    """Build the world action model with its SmolVLM condition encoder.
+
+    `vlm` may be passed to share an already-loaded encoder; otherwise one is built
+    from `args.vlm` / `args.vlm_image_size` / `args.txt_size` / `args.vlm_freeze`.
+    """
+    from vla.vlm_encoder import SmolVLMEncoder
+    if vlm is None:
+        vlm = SmolVLMEncoder(args.vlm, image_size=args.vlm_image_size,
+                             max_text_tokens=args.txt_size, freeze=bool(args.vlm_freeze))
+    top_channels = args.top_block_channels or args.channels
     return WorldActionModel(
         in_channels=args.channel_size, img_size=args.img_size,
         patch_size=args.patch_size, channels=args.channels,
         num_blocks=len(args.layers_per_block), layers_per_block=args.layers_per_block,
         head_dim=args.head_dim, num_heads=args.num_heads, num_kv_heads=args.num_kv_heads,
         rope=args.rope, pt_seq_len=args.pt_seq_len, sos=args.sos,
-        txt_size=args.txt_size, txt_dim=txt_dim, cond_top_only=args.cond_top_only,
+        txt_size=args.txt_size, txt_dim=top_channels, cond_top_only=args.cond_top_only,
         use_softplus=args.use_softplus, use_swiglu=args.use_swiglu,
         use_bias=args.use_bias, use_qk_norm=args.use_qk_norm,
         use_post_norm=args.use_post_norm, use_final_norm=args.use_final_norm,
@@ -330,4 +391,5 @@ def setup_vla_model(args, txt_dim):
         action_horizon=args.action_horizon, action_dim=args.action_dim,
         action_channels=args.action_channels, action_head_dim=args.action_head_dim,
         action_layers=args.action_layers, action_loss_weight=args.action_loss_weight,
+        vlm_dim=vlm.hidden_size, proprio_dim=args.proprio_dim, vlm=vlm,
     )

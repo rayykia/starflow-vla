@@ -1,8 +1,8 @@
 arguments:
 - dataset: libero
 - img_size: 128
-- txt_size: 64
-- channel_size: 48
+- txt_size: 40  # max SmolVLM tokens for the instruction suffix (instruction + 6 template tokens)
+- channel_size: 96  # 2 views (agentview, wrist) x 48 Wan latent channels, channel-concatenated
 - patch_size: 1
 - channels: 1024
 - blocks: 6
@@ -28,13 +28,24 @@ arguments:
 - epochs: 100
 - drop_label: 0.1
 - grad_clip: 1
-- grad_skip: 1
+# grad_skip fires when the PRE-clip norm exceeds grad_clip; this model's healthy
+# grad norm is ~5.5, so grad_skip: 1 skipped 100% of updates. Keep it off (upstream
+# default) unless grad_skip_factor is also raised well above the observed norm.
+- grad_skip: 0
+- grad_skip_factor: 10.0
 - loss_scaling: 1
 - save_every: 10
 - sample_freq: 5
 - vae: Wan-AI/Wan2.2-TI2V-5B-Diffusers:0.6
 - finetuned_vae: none
-- text: google/flan-t5-xl
+# condition encoder: SmolVLM sees the instruction + current observation; its token
+# features are projected and concatenated with a projected proprio token (vla/vlm_encoder.py)
+- vlm: HuggingFaceTB/SmolVLM-500M-Instruct
+- vlm_image_size: 512     # obs is upsampled 128 -> 512 for SigLIP (64 image tokens)
+- vlm_freeze: 0           # 1 = frozen backbone (no grads, no_grad forward)
+- vlm_lr: 2e-5            # peak LR of the VLM param group when fine-tuned (flow uses `lr`)
+- vlm_freeze_steps: 1000  # VLM LR held at 0 for the first N optimizer steps (SimVLANF's freeze_steps)
+- proprio_dim: 8          # [ee_pos(3), ee_ori(3), gripper_states(2)]
 - cfg: 1.5
 - fsdp: 0
 - gradient_checkpoint: 0
@@ -45,7 +56,7 @@ arguments:
 - action_layers: 2 2
 - action_loss_weight: 1.0
 - action_noise_std: 0.1
-- libero_root: /home/rayykia/Projects/LIBERO/libero/datasets
+- libero_root: /data/jgu/ruichend/LIBERO/libero/datasets
 - libero_subsets: libero_10
 - norm_stats: vla/norm_stats/libero_10.json
 - num_workers: 4

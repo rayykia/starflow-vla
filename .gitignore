@@ -2,3 +2,8 @@ __pycache__/
 ckpts/
 logs/
 internal.sh
+configs/wandb.env
+*.env
+wandb/
+eval_results/
+experiments/
