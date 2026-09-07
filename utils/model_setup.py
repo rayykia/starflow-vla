@@ -106,7 +106,7 @@ class VAE(nn.Module):
             self.video_vae = True  # this is a Video VAE
 
         elif 'Wan-AI/Wan2.2' in model_name:
-            filename = "/tmp/Wan2.2_VAE.pth"  # Use local temp path, download if not exists. WAN2.2 has no diffusers
+            filename = "/vast/projects/jgu32/lab/ruichend/cache/Wan2.2_VAE.pth"  # Shared cache path, download if not exists. WAN2.2 has no diffusers
             if not os.path.exists(filename):
                 if dist.local_rank == 0:
                     print("Downloading Wan2.2 VAE weights...")

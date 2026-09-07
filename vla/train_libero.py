@@ -44,6 +44,8 @@ def get_vla_parser():
     parser.add_argument('--libero_subsets', default=['libero_10'], type=str, nargs='+')
     parser.add_argument('--norm_stats', default='vla/norm_stats/libero_10.json', type=str)
     parser.add_argument('--num_workers', default=4, type=int)
+    parser.add_argument('--max_steps', default=0, type=int,
+                        help='total optimizer-step budget; >0 overrides epochs and the LR schedule length')
     parser.add_argument('--action_horizon', default=8, type=int)
     parser.add_argument('--action_dim', default=7, type=int)
     parser.add_argument('--action_channels', default=256, type=int)
@@ -133,6 +135,8 @@ def merge_cli_args(args: argparse.Namespace) -> argparse.Namespace:
 def main(args):
     args = merge_cli_args(args)
     assert args.action_horizon % 4 == 0, 'Wan2.2 needs action_horizon % 4 == 0'
+    if args.max_steps < 0:
+        raise ValueError('max_steps must be nonnegative (0 uses epochs)')
 
     dist = utils.Distributed()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -163,7 +167,13 @@ def main(args):
     # data
     data_loader = create_libero_dataloader(args, dist)
     num_batches = len(data_loader)
+    grad_accum = max(args.acc, 1)
+    steps_per_epoch = num_batches // grad_accum
+    if steps_per_epoch == 0:
+        raise ValueError('dataset must provide at least one complete optimizer step per epoch')
+    training_steps = args.max_steps or args.epochs * steps_per_epoch
     print(f'{num_batches} batches/epoch, {len(data_loader.dataset):,} samples')
+    print(f'{steps_per_epoch} optimizer steps/epoch, {training_steps:,} total steps')
 
     # frozen VAE
     vae = utils.setup_vae(args, dist, device)
@@ -182,7 +192,6 @@ def main(args):
             f'{n_vlm_train / 1e6:.1f}M trainable, lr {args.vlm_lr:g} after {args.vlm_freeze_steps} steps')
         print(f'params: flow {n_flow / 1e6:.1f}M trainable, VLM {n_vlm / 1e6:.1f}M ({vlm_note})')
 
-    grad_accum = max(args.acc, 1)
     model_name = f'vla_{args.channels}_{len(args.layers_per_block)}_h{args.action_horizon}'
     ckpt_file = args.logdir / f'libero_model_{model_name}.pth'
     opt_ckpt_file = args.logdir / f'libero_opt_{model_name}.pth'
@@ -200,8 +209,8 @@ def main(args):
     model, model_ddp = utils.parallelize_model(args, model, dist, device)
     param_groups, trainable = build_param_groups(model, args)
     optimizer = torch.optim.AdamW(param_groups, betas=(0.9, 0.95), lr=args.lr, weight_decay=1e-4)
-    warmup = args.warmup_steps if args.warmup_steps is not None else num_batches
-    lr_schedule = GroupCosineLRSchedule(optimizer, warmup, args.epochs * num_batches,
+    warmup = args.warmup_steps if args.warmup_steps is not None else min(steps_per_epoch, training_steps)
+    lr_schedule = GroupCosineLRSchedule(optimizer, warmup, training_steps,
                                         args.min_lr, args.lr)
 
     # resume optimizer/LR-schedule state (if present) alongside the model weights
@@ -218,12 +227,15 @@ def main(args):
     # loaded lr_schedule state already encodes progress; only bump the counter
     # from --resume_epoch when we had no opt checkpoint to load it from
     if not opt_state_loaded:
-        lr_schedule.counter += epoch_start * num_batches
+        lr_schedule.counter += epoch_start * steps_per_epoch
     scaler = torch.amp.GradScaler() if args.loss_scaling else None
 
     print(f'{" Training ":-^80}')
-    total_steps = epoch_start * num_batches
-    for epoch in range(epoch_start, args.epochs):
+    total_steps = int(lr_schedule.counter.item())
+    epoch = epoch_start
+    # A step budget may end within an epoch or require more epochs than the YAML
+    # specifies. Continue until the actual counter reaches it (also after resume).
+    while (total_steps < args.max_steps if args.max_steps else epoch < args.epochs):
         if hasattr(data_loader.sampler, 'set_epoch'):
             data_loader.sampler.set_epoch(epoch)
         metrics = utils.Metrics()
@@ -299,7 +311,8 @@ def main(args):
                         now = time.time()
                         steps_per_sec = (total_steps - last_log_step) / max(now - last_log_t, 1e-6)
                         last_log_t, last_log_step = now, total_steps
-                        print(f'epoch {epoch + 1}/{args.epochs}  {total_steps:,} steps - ' + '  '.join(
+                        epoch_label = str(epoch + 1) if args.max_steps else f'{epoch + 1}/{args.epochs}'
+                        print(f'epoch {epoch_label}  {total_steps:,}/{training_steps:,} steps - ' + '  '.join(
                             f'{k}: {v:.4f}' for k, v in loss_dict.items())
                             + f'  ({steps_per_sec:.2f} it/s)')
                         if use_wandb:
@@ -315,7 +328,7 @@ def main(args):
                             if grad_norm is not None:
                                 log['train/grad_norm'] = grad_norm.item()
                             wandb.log(log, step=total_steps)
-            if args.dry_run:
+            if args.dry_run or (args.max_steps and total_steps >= args.max_steps):
                 break
 
         epoch_metrics = metrics.compute(dist if dist.distributed else None)  # all-gather: every rank
@@ -347,8 +360,9 @@ def main(args):
                     log['preview/rollout'] = wandb.Video(str(video_path), fps=10, format='mp4')
                 wandb.log(log, step=total_steps)
 
-        if args.dry_run:
+        if args.dry_run or (args.max_steps and total_steps >= args.max_steps):
             break
+        epoch += 1
 
     if use_wandb:
         import wandb
