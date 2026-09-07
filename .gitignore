@@ -7,3 +7,4 @@ configs/wandb.env
 wandb/
 eval_results/
 experiments/
+docs/
